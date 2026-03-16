@@ -2,7 +2,10 @@
 """
 Scenario Classic-NET RS-485 Bus Sniffing Wizard
 ================================================
-Reverse-engineer the proprietary Classic-NET bus protocol used by Scenario
+Passive bus observation tool for achieving interoperability between Scenario
+Automacao Classic-NET modules and Home Assistant / other open platforms.
+
+Reverse-engineers the proprietary Classic-NET bus protocol used by Scenario
 Automacao home automation modules (MDM8 dimmers, RDM8 relays, etc.).
 
 Walks through 4 phases:

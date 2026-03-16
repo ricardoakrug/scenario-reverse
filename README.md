@@ -238,6 +238,22 @@ After successful captures, the `analysis/packet_summary.json` file is designed t
 5. Build a protocol spec document
 6. Implement a Home Assistant custom component that speaks Classic-NET directly over RS-485
 
+## Legal
+
+**Methodology.** This project uses passive observation of electrical signals (RS-485 differential voltage levels) on hardware owned by the user. No software is copied, decompiled, or disassembled. No access controls, encryption, or technological protection measures are circumvented.
+
+**Purpose.** Interoperability with [Home Assistant](https://www.home-assistant.io/) and other open home automation platforms.
+
+| Jurisdiction | Legal Basis |
+|-------------|-------------|
+| **Brazil** | Lei 9.609/98 Art. 6 — functional similarity developed through independent effort is not infringement |
+| **US** | DMCA §1201(f) interoperability exception; no TPM is circumvented; passive signal observation is not "access" |
+| **EU** | Directive 2009/24/EC Art. 5(3) (observation of behavior) + Art. 6 (decompilation for interop) + Art. 8 (contrary EULA clauses are void) |
+
+**Precedent.** No vendor has successfully challenged passive protocol reverse engineering for interoperability. Notable examples: OpenZWave, Lutron Caseta/RadioRA 2, SMA solar inverters.
+
+> **Disclaimer:** This is not legal advice. Consult a qualified attorney for your specific situation.
+
 ## License
 
-Personal research project. Not affiliated with Scenario Automacao.
+MIT License — see [LICENSE](LICENSE). Not affiliated with Scenario Automacao.
