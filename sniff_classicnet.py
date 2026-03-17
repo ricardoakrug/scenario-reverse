@@ -100,6 +100,16 @@ class SerialConfig:
         bits = 1 + self.bytesize + (1 if self.parity != "N" else 0) + self.stopbits
         return bits / self.baudrate
 
+    @classmethod
+    def from_dict(cls, d: dict) -> "SerialConfig":
+        return cls(
+            port=d.get("port", ""),
+            baudrate=d.get("baudrate", 9600),
+            bytesize=d.get("bytesize", 8),
+            parity=d.get("parity", "N"),
+            stopbits=d.get("stopbits", 1),
+        )
+
 
 @dataclass
 class Packet:
@@ -162,6 +172,12 @@ class BaudScanResult:
 
     def label(self) -> str:
         return f"{self.baudrate} {self.bytesize}{self.parity}{self.stopbits}"
+
+    def to_serial_config(self, port: str) -> SerialConfig:
+        return SerialConfig(
+            port=port, baudrate=self.baudrate,
+            bytesize=self.bytesize, parity=self.parity, stopbits=self.stopbits,
+        )
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -229,10 +245,11 @@ class SerialSniffer:
         self._running = False
         self._lock = threading.Lock()
         self._packets: list[Packet] = []
-        self._current_packet: Optional[Packet] = None
-        self._last_byte_time: float = 0.0
+        self._current_buf: Optional[bytearray] = None
+        self._current_ts: float = 0.0
+        self._current_gap: Optional[float] = None
+        self._last_byte_time: Optional[float] = None
         self._raw_bytes: bytearray = bytearray()
-        self._raw_timestamps: list[float] = []
         self._framing_errors: int = 0
 
     def start(self):
@@ -246,10 +263,11 @@ class SerialSniffer:
         )
         self._running = True
         self._packets = []
-        self._current_packet = None
-        self._last_byte_time = 0.0
+        self._current_buf = None
+        self._current_ts = 0.0
+        self._current_gap = None
+        self._last_byte_time = None
         self._raw_bytes = bytearray()
-        self._raw_timestamps = []
         self._framing_errors = 0
         self._thread = threading.Thread(target=self._reader_loop, daemon=True)
         self._thread.start()
@@ -260,9 +278,7 @@ class SerialSniffer:
             self._thread.join(timeout=2.0)
         # Finalize any in-progress packet
         with self._lock:
-            if self._current_packet and self._current_packet.data:
-                self._packets.append(self._current_packet)
-                self._current_packet = None
+            self._finalize_current()
         if self._ser and self._ser.is_open:
             self._ser.close()
         return list(self._packets)
@@ -286,43 +302,55 @@ class SerialSniffer:
     def clear(self):
         with self._lock:
             self._packets = []
-            self._current_packet = None
+            self._current_buf = None
             self._raw_bytes = bytearray()
-            self._raw_timestamps = []
+
+    def _finalize_current(self):
+        """Append current in-flight packet to _packets. Must hold _lock."""
+        if self._current_buf:
+            self._packets.append(Packet(
+                timestamp=self._current_ts,
+                data=bytes(self._current_buf),
+                gap_before_ms=self._current_gap,
+            ))
+            self._current_buf = None
 
     def _reader_loop(self):
         while self._running:
             try:
-                data = self._ser.read(1)
+                waiting = self._ser.in_waiting
+                data = self._ser.read(waiting or 1)
                 if not data:
                     continue
                 now = time.perf_counter()
                 with self._lock:
                     self._raw_bytes.extend(data)
-                    self._raw_timestamps.append(now)
 
-                    if self._last_byte_time == 0.0:
-                        # First byte ever
-                        self._current_packet = Packet(timestamp=now, data=data, gap_before_ms=None)
-                    else:
-                        gap = now - self._last_byte_time
-                        if gap > self.gap_threshold:
-                            # Gap detected → finalize current, start new
-                            if self._current_packet and self._current_packet.data:
-                                self._packets.append(self._current_packet)
-                            self._current_packet = Packet(
-                                timestamp=now,
-                                data=data,
-                                gap_before_ms=gap * 1000.0,
-                            )
+                    for byte in data:
+                        b = bytes([byte])
+                        if self._last_byte_time is None:
+                            # First byte ever
+                            self._current_buf = bytearray(b)
+                            self._current_ts = now
+                            self._current_gap = None
                         else:
-                            # Same packet
-                            if self._current_packet:
-                                self._current_packet.data += data
+                            gap = now - self._last_byte_time
+                            if gap > self.gap_threshold:
+                                # Gap detected → finalize current, start new
+                                self._finalize_current()
+                                self._current_buf = bytearray(b)
+                                self._current_ts = now
+                                self._current_gap = gap * 1000.0
                             else:
-                                self._current_packet = Packet(timestamp=now, data=data)
+                                # Same packet
+                                if self._current_buf is not None:
+                                    self._current_buf.append(byte)
+                                else:
+                                    self._current_buf = bytearray(b)
+                                    self._current_ts = now
+                                    self._current_gap = None
 
-                    self._last_byte_time = now
+                        self._last_byte_time = now
 
             except serial.SerialException:
                 self._framing_errors += 1
@@ -395,8 +423,9 @@ class BaudDetector:
                 total_bytes=total_bytes,
             )
 
-        entropy = self._shannon_entropy(raw)
-        chi_sq = self._chi_squared(raw)
+        byte_counts = Counter(raw)
+        entropy = self._shannon_entropy(byte_counts, total_bytes)
+        chi_sq = self._chi_squared(byte_counts, total_bytes)
         consistent_lengths = self._check_consistent_lengths(packets)
         consistent_start = self._check_consistent_start_byte(packets)
 
@@ -433,7 +462,9 @@ class BaudDetector:
             score -= min(30.0, framing_errors * 5.0)
 
         # Fallback: UTF-8/printable check (erd0spy-style)
-        printable_ratio = sum(1 for b in raw if 0x20 <= b <= 0x7e or b in (0x0a, 0x0d, 0x09)) / total_bytes
+        printable_ratio = sum(
+            c for b, c in byte_counts.items() if 0x20 <= b <= 0x7e or b in (0x0a, 0x0d, 0x09)
+        ) / total_bytes
         if printable_ratio > 0.8:
             score += 15.0  # Might be text-based protocol
 
@@ -453,24 +484,20 @@ class BaudDetector:
         )
 
     @staticmethod
-    def _shannon_entropy(data: bytes) -> float:
-        if not data:
+    def _shannon_entropy(counts: Counter, length: int) -> float:
+        if length == 0:
             return 0.0
-        counts = Counter(data)
-        length = len(data)
         entropy = 0.0
         for count in counts.values():
             p = count / length
-            if p > 0:
-                entropy -= p * math.log2(p)
+            entropy -= p * math.log2(p)
         return entropy
 
     @staticmethod
-    def _chi_squared(data: bytes) -> float:
-        if not data:
+    def _chi_squared(counts: Counter, length: int) -> float:
+        if length == 0:
             return 0.0
-        counts = Counter(data)
-        expected = len(data) / 256.0
+        expected = length / 256.0
         chi_sq = sum((counts.get(i, 0) - expected) ** 2 / expected for i in range(256))
         return chi_sq
 
@@ -529,9 +556,11 @@ class GuidedCapture:
         self._load_existing()
 
     def _load_existing(self):
-        if self.captures_file.exists():
+        try:
             with open(self.captures_file) as f:
                 self.captures = json.load(f)
+        except FileNotFoundError:
+            pass
 
     def _save(self):
         with open(self.captures_file, "w") as f:
@@ -548,9 +577,10 @@ class GuidedCapture:
         print(f"  {total} steps — skip any with 's', add notes with 'n', repeat with 'r'")
         print(f"{'='*60}\n")
 
+        done = self.completed_ids
         for i, step in enumerate(self.GUIDED_STEPS):
             step_id = i + 1
-            if step_id in self.completed_ids:
+            if step_id in done:
                 print(f"  [{step_id}/{total}] {step['label']} — already captured, skipping")
                 continue
 
@@ -665,9 +695,11 @@ class TestMatrix:
         self._load_existing()
 
     def _load_existing(self):
-        if self.captures_file.exists():
+        try:
             with open(self.captures_file) as f:
                 self.captures = json.load(f)
+        except FileNotFoundError:
+            pass
 
     def _save(self):
         with open(self.captures_file, "w") as f:
@@ -677,30 +709,14 @@ class TestMatrix:
     def completed_ids(self) -> set[int]:
         return {c["id"] for c in self.captures}
 
-    def generate_quick_matrix(self) -> list[dict]:
-        """2 channels per module (ch1, ch8) × all operations."""
+    def generate_matrix(self, full: bool = False) -> list[dict]:
+        """Generate test matrix steps. Quick = ch1+ch8 per module, full = all channels."""
         steps = []
         idx = 0
         for mod in self.modules:
-            for ch in [1, min(8, mod["channels"])]:
-                for op in mod["operations"]:
-                    idx += 1
-                    steps.append({
-                        "id": idx,
-                        "label": f"{mod['label']} CH{ch} {op.upper()}",
-                        "module_type": mod["type"],
-                        "module_index": mod["index"],
-                        "channel": ch,
-                        "action": op,
-                    })
-        return steps
-
-    def generate_full_matrix(self) -> list[dict]:
-        """All channels × all operations × all modules."""
-        steps = []
-        idx = 0
-        for mod in self.modules:
-            for ch in range(1, mod["channels"] + 1):
+            channels = (range(1, mod["channels"] + 1) if full
+                        else [1, min(8, mod["channels"])])
+            for ch in channels:
                 for op in mod["operations"]:
                     idx += 1
                     steps.append({
@@ -714,7 +730,7 @@ class TestMatrix:
         return steps
 
     def run(self, full: bool = False):
-        steps = self.generate_full_matrix() if full else self.generate_quick_matrix()
+        steps = self.generate_matrix(full=full)
         total = len(steps)
         mode = "FULL" if full else "QUICK"
 
@@ -723,8 +739,9 @@ class TestMatrix:
         print(f"  {total} captures — pause with 'p', quit with 'q'")
         print(f"{'='*60}\n")
 
+        done = self.completed_ids
         for step in steps:
-            if step["id"] in self.completed_ids:
+            if step["id"] in done:
                 print(f"  [{step['id']}/{total}] {step['label']} — already done")
                 continue
 
@@ -833,6 +850,7 @@ class Analyzer:
     def _unique_packets(self, captures: list[dict]) -> list[dict]:
         """Find unique packets with occurrence counts and action contexts."""
         packet_map: dict[str, dict] = {}
+        context_sets: dict[str, set] = {}
         for cap in captures:
             for pkt in cap.get("packets", []):
                 hex_str = pkt["hex"]
@@ -841,12 +859,13 @@ class Analyzer:
                         "hex": hex_str,
                         "length": pkt["length"],
                         "count": 0,
-                        "contexts": [],
                     }
+                    context_sets[hex_str] = set()
                 packet_map[hex_str]["count"] += 1
-                ctx = f"{cap.get('label', '?')}"
-                if ctx not in packet_map[hex_str]["contexts"]:
-                    packet_map[hex_str]["contexts"].append(ctx)
+                context_sets[hex_str].add(cap.get("label", "?"))
+
+        for hex_str, entry in packet_map.items():
+            entry["contexts"] = sorted(context_sets[hex_str])
 
         unique = sorted(packet_map.values(), key=lambda x: x["count"], reverse=True)
         print(f"  Found {len(unique)} unique packets")
@@ -984,51 +1003,31 @@ class Analyzer:
         if not all_packets:
             return results
 
-        # Test: last byte = XOR of all previous bytes
-        xor_matches = sum(1 for p in all_packets if self._xor_check(p))
-        results.append({
-            "algorithm": "XOR (last byte)",
-            "matches": xor_matches,
-            "total": len(all_packets),
-            "ratio": round(xor_matches / len(all_packets), 3),
-        })
-
-        # Test: last byte = SUM mod 256 of all previous bytes
-        sum_matches = sum(1 for p in all_packets if self._sum_check(p))
-        results.append({
-            "algorithm": "SUM mod 256 (last byte)",
-            "matches": sum_matches,
-            "total": len(all_packets),
-            "ratio": round(sum_matches / len(all_packets), 3),
-        })
-
-        # Test: last byte = 2's complement checksum
-        twos_matches = sum(1 for p in all_packets if self._twos_complement_check(p))
-        results.append({
-            "algorithm": "2's complement sum (last byte)",
-            "matches": twos_matches,
-            "total": len(all_packets),
-            "ratio": round(twos_matches / len(all_packets), 3),
-        })
-
-        # Test: CRC-8 (simple polynomial 0x07)
-        crc8_matches = sum(1 for p in all_packets if self._crc8_check(p))
-        results.append({
-            "algorithm": "CRC-8 (poly 0x07, last byte)",
-            "matches": crc8_matches,
-            "total": len(all_packets),
-            "ratio": round(crc8_matches / len(all_packets), 3),
-        })
+        # Test single-byte checksum algorithms
+        checks = [
+            ("XOR (last byte)", self._xor_check),
+            ("SUM mod 256 (last byte)", self._sum_check),
+            ("2's complement sum (last byte)", self._twos_complement_check),
+            ("CRC-8 (poly 0x07, last byte)", self._crc8_check),
+        ]
+        for algo_name, check_fn in checks:
+            matches = sum(1 for p in all_packets if check_fn(p))
+            results.append({
+                "algorithm": algo_name,
+                "matches": matches,
+                "total": len(all_packets),
+                "ratio": round(matches / len(all_packets), 3),
+            })
 
         # Test: last 2 bytes = CRC-16 (Modbus)
-        crc16_matches = sum(1 for p in all_packets if len(p) >= 4 and self._crc16_modbus_check(p))
-        applicable_crc16 = sum(1 for p in all_packets if len(p) >= 4)
-        if applicable_crc16:
+        crc16_eligible = [p for p in all_packets if len(p) >= 4]
+        if crc16_eligible:
+            crc16_matches = sum(1 for p in crc16_eligible if self._crc16_modbus_check(p))
             results.append({
                 "algorithm": "CRC-16/Modbus (last 2 bytes)",
                 "matches": crc16_matches,
-                "total": applicable_crc16,
-                "ratio": round(crc16_matches / applicable_crc16, 3),
+                "total": len(crc16_eligible),
+                "ratio": round(crc16_matches / len(crc16_eligible), 3),
             })
 
         print(f"  Tested {len(results)} checksum algorithms")
@@ -1197,14 +1196,7 @@ class Wizard:
         self.session = CaptureSession.load(session_dir)
         self.modules = self.session.state.get("modules", DEFAULT_MODULES)
         if self.session.state.get("serial_config"):
-            sc = self.session.state["serial_config"]
-            self.config = SerialConfig(
-                port=sc.get("port", ""),
-                baudrate=sc.get("baudrate", 9600),
-                bytesize=sc.get("bytesize", 8),
-                parity=sc.get("parity", "N"),
-                stopbits=sc.get("stopbits", 1),
-            )
+            self.config = SerialConfig.from_dict(self.session.state["serial_config"])
         print(f"  Resumed session: {self.session.base_dir}")
         print(f"  Completed phases: {self.session.state.get('phases_completed', [])}\n")
 
@@ -1339,10 +1331,11 @@ class Wizard:
             else:
                 ops = ["open", "close", "stop"]
 
+            type_index = sum(1 for m in self.modules if m["type"] == mod_type) + 1
             self.modules.append({
                 "type": mod_type,
-                "index": sum(1 for m in self.modules if m["type"] == mod_type) + 1,
-                "label": f"{mod_type} #{sum(1 for m in self.modules if m['type'] == mod_type) + 1}",
+                "index": type_index,
+                "label": f"{mod_type} #{type_index}",
                 "channels": channels,
                 "operations": ops,
             })
@@ -1524,13 +1517,7 @@ class Wizard:
             if not sc:
                 print("  ERROR: No serial config. Run Phase 2 first.")
                 sys.exit(1)
-            self.config = SerialConfig(
-                port=sc["port"],
-                baudrate=sc["baudrate"],
-                bytesize=sc["bytesize"],
-                parity=sc["parity"],
-                stopbits=sc["stopbits"],
-            )
+            self.config = SerialConfig.from_dict(sc)
 
         print(f"  Starting sniffer: {self.config.label()} on {self.config.port}")
         self.sniffer = SerialSniffer(self.config)
