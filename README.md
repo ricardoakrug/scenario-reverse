@@ -30,30 +30,30 @@ The USB adapter connects in **listen-only mode** (no transmission) — it passiv
 
 ## Requirements
 
-- Python 3.10+
+- [uv](https://docs.astral.sh/uv/) (handles Python and `pyserial` automatically via PEP 723)
 - USB-to-RS-485 adapter (FT232RL, CH340, or CP2102 based)
 
-```bash
-pip install pyserial
-```
+No manual install needed — `uv run` resolves deps from the script header.
 
 ## Quick Start
 
 ```bash
 # Full wizard — walks through all 4 phases
-python3 sniff_classicnet.py
+./sniff_classicnet.py
+# or
+uv run sniff_classicnet.py
 
 # Resume a previous session
-python3 sniff_classicnet.py --resume sessions/2026-03-16_143022/
+uv run sniff_classicnet.py --resume sessions/2026-03-16_143022/
 
 # Jump to a specific phase
-python3 sniff_classicnet.py --phase 3 --resume sessions/2026-03-16_143022/
+uv run sniff_classicnet.py --phase 3 --resume sessions/2026-03-16_143022/
 
 # Re-run analysis on existing captures
-python3 sniff_classicnet.py --analyze sessions/2026-03-16_143022/
+uv run sniff_classicnet.py --analyze sessions/2026-03-16_143022/
 
 # Skip port auto-detection
-python3 sniff_classicnet.py --port /dev/cu.usbserial-XYZ
+uv run sniff_classicnet.py --port /dev/cu.usbserial-XYZ
 ```
 
 ## How It Works

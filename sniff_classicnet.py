@@ -1,4 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["pyserial>=3.5"]
+# ///
 """
 Scenario Classic-NET RS-485 Bus Sniffing Wizard
 ================================================
@@ -14,7 +18,7 @@ Walks through 4 phases:
   3. Guided Capture — interactive step-by-step capture of known actions
   4. Test Matrix    — systematic full-matrix capture across all modules/channels
 
-Only dependency: pyserial (pip install pyserial)
+Only dependency: pyserial — handled automatically via `uv run` (PEP 723).
 """
 
 from __future__ import annotations
